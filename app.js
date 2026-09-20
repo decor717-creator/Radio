@@ -56,6 +56,13 @@ let eqGraphReady = false;
 let audioContext = null;
 let eqFilters = [];
 let eqPreset = localStorage.getItem('radioEqPreset') || 'flat';
+let activePlayer = audio;
+let userPaused = true;
+let switchingPlayer = false;
+let interruptedPlayback = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 3;
 const pageSize = 30;
 
 const favorites = new Set(safeParse('radioFavorites', []));
@@ -304,66 +311,111 @@ function toggleFavorite(uuid) {
   showFavoritesOnly ? renderFavorites() : renderStations();
 }
 
-async function playStation(station, index = -1) {
+async function playStation(station, index = -1, { recovery = false } = {}) {
   if (!station?.url) return;
-  audio.pause();
-  eqAudio.pause();
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  userPaused = false;
+  interruptedPlayback = false;
+
   currentStation = station;
   cacheStation(station);
   saveCache();
   currentIndex = index >= 0 ? index : visibleStations.findIndex(s => s.stationuuid === station.stationuuid);
-  updateNowPlaying('Подключение…');
+  updateNowPlaying(recovery ? 'Восстановление эфира…' : 'Подключение…');
 
-  let player = audio;
+  let player = eqEnabled ? eqAudio : audio;
   if (eqEnabled) {
-    const compatible = await canUseCorsStream(station.url);
-    if (compatible) {
-      try {
-        await ensureEqGraph();
-        player = eqAudio;
-        audio.pause();
-      } catch (err) {
-        console.warn('EQ unavailable', err);
-        eqEnabled = false;
-        eqToggle.checked = false;
-        updateEqUi('Эквалайзер недоступен в этом браузере');
-        player = audio;
-      }
-    } else {
+    try {
+      await ensureEqGraph();
+    } catch (err) {
+      console.warn('EQ unavailable', err);
+      eqEnabled = false;
+      eqToggle.checked = false;
+      updateEqUi('Эквалайзер недоступен в этом браузере');
+      player = audio;
+    }
+  }
+
+  switchingPlayer = true;
+  const other = player === audio ? eqAudio : audio;
+  other.pause();
+  activePlayer = player;
+
+  try {
+    const resolvedCurrent = player.currentSrc || player.src || '';
+    if (resolvedCurrent !== station.url) {
+      player.src = station.url;
+      player.load();
+    }
+    await player.play();
+    reconnectAttempts = 0;
+    updateNowPlaying('В эфире');
+    addToHistory(station);
+    if (!recovery) reportClick(station.stationuuid);
+  } catch (err) {
+    console.error(err);
+
+    if (player === eqAudio && eqEnabled) {
       eqEnabled = false;
       eqToggle.checked = false;
       updateEqUi('Этот поток не поддерживает эквалайзер');
-      showToast('Для этой станции эквалайзер недоступен');
-      player = audio;
+      showToast('Эквалайзер отключён для этой станции');
+      activePlayer = audio;
+      switchingPlayer = false;
+      return playStation(station, currentIndex, { recovery });
     }
-  } else {
-    eqAudio.pause();
-  }
 
-  if (player.src !== station.url) {
-    player.src = station.url;
-    player.load();
-  }
-
-  try {
-    await player.play();
-    updateNowPlaying('В эфире');
-    addToHistory(station);
-    reportClick(station.stationuuid);
-  } catch (err) {
-    console.error(err);
     updateNowPlaying('Не удалось запустить поток');
     showToast('Поток станции сейчас не воспроизводится');
+    scheduleReconnect();
+  } finally {
+    switchingPlayer = false;
+    renderAllPlayingStates();
   }
+}
+
+function activeAudio() { return activePlayer; }
+
+function pauseRadio() {
+  userPaused = true;
+  interruptedPlayback = false;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  switchingPlayer = true;
+  audio.pause();
+  eqAudio.pause();
+  switchingPlayer = false;
+  updateNowPlaying('Пауза');
   renderAllPlayingStates();
 }
 
-function activeAudio() { return eqEnabled && !eqAudio.paused ? eqAudio : audio; }
-function pauseRadio() {
-  audio.pause();
-  eqAudio.pause();
-  updateNowPlaying('Пауза');
-  renderAllPlayingStates();
+function scheduleReconnect(delay = 1800) {
+  if (!currentStation || userPaused || reconnectTimer || !navigator.onLine) return;
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    updateNowPlaying('Поток временно недоступен');
+    return;
+  }
+  reconnectAttempts += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!currentStation || userPaused) return;
+    playStation(currentStation, currentIndex, { recovery: true });
+  }, delay);
+}
+
+function recoverInterruptedPlayback() {
+  if (!currentStation || userPaused || document.visibilityState === 'hidden') return;
+  if (!activeAudio().paused) {
+    interruptedPlayback = false;
+    return;
+  }
+  if (!interruptedPlayback && reconnectAttempts === 0) return;
+  setTimeout(() => {
+    if (currentStation && !userPaused && activeAudio().paused) {
+      playStation(currentStation, currentIndex, { recovery: true });
+    }
+  }, 350);
 }
 function togglePlay() {
   if (!currentStation) {
@@ -558,16 +610,6 @@ function updateSleepBadge() {
   sleepBadge.hidden = false;
 }
 
-async function canUseCorsStream(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2500);
-  try {
-    const response = await fetch(url, { mode: 'cors', method: 'GET', signal: controller.signal, cache: 'no-store' });
-    return response.ok || response.type === 'cors';
-  } catch (_) { return false; }
-  finally { clearTimeout(timer); controller.abort(); }
-}
-
 async function ensureEqGraph() {
   if (eqGraphReady) {
     if (audioContext?.state === 'suspended') await audioContext.resume();
@@ -601,14 +643,11 @@ function applyEqPreset(name) {
 
 async function toggleEq(on) {
   if (!on) {
+    const wasPlaying = currentStation && !activeAudio().paused;
     eqEnabled = false;
     eqToggle.checked = false;
     updateEqUi('Включается для совместимых потоков');
-    if (currentStation) {
-      const wasPlaying = !eqAudio.paused;
-      eqAudio.pause();
-      if (wasPlaying) await playStation(currentStation, currentIndex);
-    }
+    if (wasPlaying) await playStation(currentStation, currentIndex, { recovery: true });
     return;
   }
   if (!currentStation) {
@@ -616,23 +655,13 @@ async function toggleEq(on) {
     showToast('Сначала включите радиостанцию');
     return;
   }
-  updateEqUi('Проверяем поток…');
-  const compatible = await canUseCorsStream(currentStation.url);
-  if (!compatible) {
-    eqEnabled = false;
-    eqToggle.checked = false;
-    updateEqUi('Этот поток не поддерживает эквалайзер');
-    showToast('Для этой станции эквалайзер недоступен');
-    return;
-  }
   try {
+    const wasPlaying = !activeAudio().paused;
     eqEnabled = true;
     await ensureEqGraph();
     eqToggle.checked = true;
     updateEqUi(`Включён · ${presetLabel(eqPreset)}`);
-    const wasPlaying = !audio.paused || !eqAudio.paused;
-    audio.pause();
-    if (wasPlaying) await playStation(currentStation, currentIndex);
+    if (wasPlaying) await playStation(currentStation, currentIndex, { recovery: true });
   } catch (err) {
     console.error(err);
     eqEnabled = false;
@@ -729,10 +758,51 @@ $('addStationForm').addEventListener('submit', (e) => {
 });
 
 [audio, eqAudio].forEach(player => {
-  player.addEventListener('playing', () => { if (player === activeAudio()) updateNowPlaying('В эфире'); });
-  player.addEventListener('pause', () => { if (currentStation && audio.paused && eqAudio.paused) updateNowPlaying('Пауза'); });
-  player.addEventListener('waiting', () => { if (player === activeAudio() && currentStation) updateNowPlaying('Буферизация…'); });
-  player.addEventListener('error', () => { if (player === activeAudio() && currentStation) updateNowPlaying('Ошибка потока'); });
+  player.addEventListener('playing', () => {
+    if (player !== activeAudio()) return;
+    interruptedPlayback = false;
+    reconnectAttempts = 0;
+    updateNowPlaying('В эфире');
+  });
+
+  player.addEventListener('pause', () => {
+    if (player !== activeAudio() || switchingPlayer || !currentStation) return;
+    if (!userPaused) {
+      interruptedPlayback = true;
+      updateNowPlaying('Воспроизведение прервано');
+    } else {
+      updateNowPlaying('Пауза');
+    }
+  });
+
+  player.addEventListener('waiting', () => {
+    if (player === activeAudio() && currentStation && !userPaused) updateNowPlaying('Буферизация…');
+  });
+
+  player.addEventListener('stalled', () => {
+    if (player === activeAudio() && currentStation && !userPaused) {
+      updateNowPlaying('Восстанавливаем поток…');
+      scheduleReconnect(2200);
+    }
+  });
+
+  player.addEventListener('error', () => {
+    if (player === activeAudio() && currentStation && !userPaused) {
+      updateNowPlaying('Ошибка потока');
+      scheduleReconnect();
+    }
+  });
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') recoverInterruptedPlayback();
+});
+window.addEventListener('pageshow', recoverInterruptedPlayback);
+window.addEventListener('online', () => {
+  if (currentStation && !userPaused && activeAudio().paused) {
+    interruptedPlayback = true;
+    recoverInterruptedPlayback();
+  }
 });
 
 if ('mediaSession' in navigator) {
