@@ -1,6 +1,6 @@
-const CACHE = 'my-radio-shell-v5';
+const CACHE = 'my-radio-shell-v6';
 const SHELL = [
-  './', './index.html', './styles.css?v=4', './app.js?v=5',
+  './', './index.html', './styles.css?v=4', './app.js?v=6',
   './manifest.webmanifest', './icon-192.png', './icon-512.png'
 ];
 
