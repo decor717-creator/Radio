@@ -469,15 +469,19 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
 
   switchingPlayer = true;
   const other = player === audio ? eqAudio : audio;
-  other.pause();
+
+  // Always tear down the inactive element. On iOS two half-open live streams
+  // can compete for the same media/network resources and cause stuttering.
+  resetStreamPlayer(other);
   activePlayer = player;
 
   try {
-    const resolvedCurrent = player.currentSrc || player.src || '';
-    if (resolvedCurrent !== station.url) {
-      player.src = station.url;
-      player.load();
-    }
+    // A live stream must start as a brand-new HTTP request every time.
+    // Safari may otherwise reuse a stale buffered connection after pause.
+    resetStreamPlayer(player);
+    player.preload = 'none';
+    player.src = freshStreamUrl(station.url);
+    player.load();
     await player.play();
     reconnectAttempts = 0;
     updateNowPlaying('В эфире');
@@ -513,6 +517,17 @@ function resetStreamPlayer(player) {
     player.removeAttribute('src');
     player.load();
   } catch (_) {}
+}
+
+function freshStreamUrl(url) {
+  try {
+    const parsed = new URL(url, window.location.href);
+    parsed.searchParams.set('_radioRestart', String(Date.now()));
+    return parsed.href;
+  } catch (_) {
+    const joiner = String(url).includes('?') ? '&' : '?';
+    return `${url}${joiner}_radioRestart=${Date.now()}`;
+  }
 }
 
 function pauseRadio() {
