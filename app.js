@@ -70,6 +70,61 @@ const stationCache = safeParse('radioStationCache', {});
 let history = safeParse('radioHistory', []);
 let customStations = safeParse('radioCustomStations', []);
 
+const CURATED_DNB_STATIONS = [
+  {
+    stationuuid: 'curated-bassdrive',
+    name: 'Bassdrive',
+    url: 'https://chi.bassdrive.co/stream',
+    favicon: '',
+    countrycode: 'US',
+    country: 'Worldwide',
+    language: 'English',
+    tags: 'drum and bass,dnb,jungle,liquid',
+    codec: 'MP3',
+    bitrate: 192,
+    custom: false,
+  },
+  {
+    stationuuid: 'curated-dnbradio',
+    name: 'DNBRADIO',
+    url: 'https://azura.dnbradio.com/listen/dnbradio/dnbradio_main.mp3',
+    favicon: '',
+    countrycode: 'US',
+    country: 'Worldwide',
+    language: 'English',
+    tags: 'drum and bass,dnb,jungle',
+    codec: 'MP3',
+    bitrate: 320,
+    custom: false,
+  },
+  {
+    stationuuid: 'curated-neurofunk-radio',
+    name: 'Neurofunk Radio',
+    url: 'https://s54.radiolize.com/radio/8120/radio.mp3',
+    favicon: '',
+    countrycode: 'US',
+    country: 'Worldwide',
+    language: 'English',
+    tags: 'neurofunk,drum and bass,dnb,techstep',
+    codec: 'MP3',
+    bitrate: 0,
+    custom: false,
+  },
+  {
+    stationuuid: 'curated-dnb247',
+    name: 'DnB247.FM',
+    url: 'https://a6.asurahosting.com:8050/radio.mp3',
+    favicon: '',
+    countrycode: 'GB',
+    country: 'United Kingdom',
+    language: 'English',
+    tags: 'drum and bass,dnb,liquid,neurofunk,jungle',
+    codec: 'MP3',
+    bitrate: 192,
+    custom: false,
+  },
+];
+
 
 const modeConfig = {
   popular: { title: 'Популярные станции', params: { order: 'clickcount', reverse: 'true' } },
@@ -148,6 +203,7 @@ async function loadFeatured() {
 async function loadStations({ append = false, search = '' } = {}) {
   if (showFavoritesOnly) return renderFavorites();
   if (currentMode === 'custom') return renderCustomStations();
+  if (currentMode === 'dnb') return renderDnbStations(search);
 
   statusText.textContent = 'Загрузка…';
   if (!append) {
@@ -288,6 +344,22 @@ function renderFavorites() {
   loadMoreBtn.hidden = true;
   renderStations();
 }
+function renderDnbStations(search = '') {
+  const q = String(search || '').trim().toLowerCase();
+  visibleStations = CURATED_DNB_STATIONS
+    .map(cleanStation)
+    .filter(validStation)
+    .filter(s => !q || [s.name, s.tags, s.country, s.codec].join(' ').toLowerCase().includes(q));
+
+  visibleStations.forEach(cacheStation);
+  saveCache();
+  stations = visibleStations;
+  listTitle.textContent = q ? `Drum & Bass: ${search}` : 'Drum & Bass — лучшие станции';
+  statusText.textContent = `${visibleStations.length} станц.`;
+  loadMoreBtn.hidden = true;
+  renderStations();
+}
+
 function renderCustomStations() {
   visibleStations = customStations.map(cleanStation);
   listTitle.textContent = 'Мои станции';
@@ -523,7 +595,7 @@ function moveStation(direction) {
 }
 
 function reportClick(uuid) {
-  if (!uuid || String(uuid).startsWith('custom-')) return;
+  if (!uuid || String(uuid).startsWith('custom-') || String(uuid).startsWith('curated-')) return;
   fetch(`${activeServer}/json/url/${encodeURIComponent(uuid)}`).catch(() => {});
 }
 
