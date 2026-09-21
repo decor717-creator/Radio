@@ -449,15 +449,29 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
 
 function activeAudio() { return activePlayer; }
 
+function resetStreamPlayer(player) {
+  try {
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+  } catch (_) {}
+}
+
 function pauseRadio() {
   userPaused = true;
   interruptedPlayback = false;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  reconnectAttempts = 0;
+
+  // Live radio streams should not stay half-open on iOS/Safari.
+  // Fully close both media connections so Play starts a fresh stream
+  // instead of resuming a stale buffered socket that can stutter.
   switchingPlayer = true;
-  audio.pause();
-  eqAudio.pause();
+  resetStreamPlayer(audio);
+  resetStreamPlayer(eqAudio);
   switchingPlayer = false;
+
   updateNowPlaying('Пауза');
   renderAllPlayingStates();
 }
