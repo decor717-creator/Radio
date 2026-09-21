@@ -1,7 +1,10 @@
-const API_SERVERS = [
+const FALLBACK_API_SERVERS = [
   'https://de1.api.radio-browser.info',
   'https://nl1.api.radio-browser.info'
 ];
+let API_SERVERS = [...FALLBACK_API_SERVERS];
+const API_DISCOVERY_URL = 'https://all.api.radio-browser.info/json/servers';
+const API_TIMEOUT_MS = 4500;
 
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
@@ -47,6 +50,7 @@ let showFavoritesOnly = false;
 let offset = 0;
 let searchTimer = null;
 let activeServer = API_SERVERS[0];
+let apiDiscoveryPromise = null;
 let toastTimer = null;
 let sleepTimeout = null;
 let sleepInterval = null;
@@ -170,19 +174,73 @@ function cleanStation(s) {
   };
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function discoverApiServers() {
+  if (apiDiscoveryPromise) return apiDiscoveryPromise;
+
+  apiDiscoveryPromise = (async () => {
+    try {
+      const response = await fetchWithTimeout(API_DISCOVERY_URL, {
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store'
+      }, 5000);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const data = await response.json();
+      const discovered = [...new Set(
+        (Array.isArray(data) ? data : [])
+          .map(item => String(item?.name || '').trim())
+          .filter(Boolean)
+          .map(name => `https://${name}`)
+      )];
+
+      if (discovered.length) {
+        API_SERVERS = [...new Set([...discovered, ...FALLBACK_API_SERVERS])];
+        if (!API_SERVERS.includes(activeServer)) activeServer = API_SERVERS[0];
+      }
+    } catch (err) {
+      console.warn('Radio Browser server discovery failed, using fallback mirrors', err);
+    }
+    return API_SERVERS;
+  })();
+
+  return apiDiscoveryPromise;
+}
+
 async function apiFetch(path, params = {}) {
+  await discoverApiServers();
+
   const qs = new URLSearchParams(params).toString();
   let lastError;
-  for (const server of [activeServer, ...API_SERVERS.filter(s => s !== activeServer)]) {
+  const servers = [activeServer, ...API_SERVERS.filter(s => s !== activeServer)];
+
+  for (const server of servers) {
     try {
-      const response = await fetch(`${server}${path}${qs ? `?${qs}` : ''}`, {
-        headers: { 'Accept': 'application/json' }
-      });
+      const response = await fetchWithTimeout(
+        `${server}${path}${qs ? `?${qs}` : ''}`,
+        {
+          headers: { 'Accept': 'application/json' },
+          cache: 'no-store'
+        }
+      );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       activeServer = server;
       return await response.json();
-    } catch (err) { lastError = err; }
+    } catch (err) {
+      lastError = err;
+      console.warn('Radio Browser mirror failed:', server, err?.name || err?.message || err);
+    }
   }
+
   throw lastError || new Error('Сервис радиостанций недоступен');
 }
 
@@ -610,7 +668,7 @@ function moveStation(direction) {
 
 function reportClick(uuid) {
   if (!uuid || String(uuid).startsWith('custom-') || String(uuid).startsWith('curated-')) return;
-  fetch(`${activeServer}/json/url/${encodeURIComponent(uuid)}`).catch(() => {});
+  fetchWithTimeout(`${activeServer}/json/url/${encodeURIComponent(uuid)}`, {}, 3000).catch(() => {});
 }
 
 function addToHistory(station) {
@@ -904,4 +962,5 @@ if ('serviceWorker' in navigator) {
 
 applyEqPreset(eqPreset);
 renderHistory();
+discoverApiServers().catch(() => {});
 Promise.allSettled([loadFeatured(), loadStations()]);
