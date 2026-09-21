@@ -66,7 +66,11 @@ let switchingPlayer = false;
 let interruptedPlayback = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 3;
+let connectWatchdogTimer = null;
+let bufferWatchdogTimer = null;
+const MAX_RECONNECT_ATTEMPTS = 4;
+const CONNECT_TIMEOUT_MS = 7000;
+const BUFFER_TIMEOUT_MS = 5000;
 const pageSize = 30;
 
 const favorites = new Set(safeParse('radioFavorites', []));
@@ -445,6 +449,7 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
   if (!station?.url) return;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  clearPlaybackWatchdogs();
   userPaused = false;
   interruptedPlayback = false;
 
@@ -482,7 +487,10 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
     player.preload = 'none';
     player.src = freshStreamUrl(station.url);
     player.load();
+    startConnectWatchdog(station, currentIndex);
     await player.play();
+    clearTimeout(connectWatchdogTimer);
+    connectWatchdogTimer = null;
     reconnectAttempts = 0;
     updateNowPlaying('В эфире');
     addToHistory(station);
@@ -530,11 +538,44 @@ function freshStreamUrl(url) {
   }
 }
 
+function clearPlaybackWatchdogs() {
+  clearTimeout(connectWatchdogTimer);
+  clearTimeout(bufferWatchdogTimer);
+  connectWatchdogTimer = null;
+  bufferWatchdogTimer = null;
+}
+
+function startConnectWatchdog(station, index) {
+  clearTimeout(connectWatchdogTimer);
+  connectWatchdogTimer = setTimeout(() => {
+    if (!currentStation || userPaused) return;
+    if (currentStation.stationuuid !== station.stationuuid) return;
+    if (!activeAudio().paused && activeAudio().readyState >= 3) return;
+
+    updateNowPlaying('Переподключаемся…');
+    resetStreamPlayer(activeAudio());
+    scheduleReconnect(0);
+  }, CONNECT_TIMEOUT_MS);
+}
+
+function startBufferWatchdog() {
+  clearTimeout(bufferWatchdogTimer);
+  bufferWatchdogTimer = setTimeout(() => {
+    if (!currentStation || userPaused) return;
+    if (!activeAudio().paused && activeAudio().readyState >= 3) return;
+
+    updateNowPlaying('Поток завис — переподключаемся…');
+    resetStreamPlayer(activeAudio());
+    scheduleReconnect(0);
+  }, BUFFER_TIMEOUT_MS);
+}
+
 function pauseRadio() {
   userPaused = true;
   interruptedPlayback = false;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  clearPlaybackWatchdogs();
   reconnectAttempts = 0;
 
   // Live radio streams should not stay half-open on iOS/Safari.
@@ -559,6 +600,7 @@ function scheduleReconnect(delay = 1800) {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (!currentStation || userPaused) return;
+    clearPlaybackWatchdogs();
     playStation(currentStation, currentIndex, { recovery: true });
   }, delay);
 }
@@ -919,6 +961,7 @@ $('addStationForm').addEventListener('submit', (e) => {
 [audio, eqAudio].forEach(player => {
   player.addEventListener('playing', () => {
     if (player !== activeAudio()) return;
+    clearPlaybackWatchdogs();
     interruptedPlayback = false;
     reconnectAttempts = 0;
     updateNowPlaying('В эфире');
@@ -935,20 +978,24 @@ $('addStationForm').addEventListener('submit', (e) => {
   });
 
   player.addEventListener('waiting', () => {
-    if (player === activeAudio() && currentStation && !userPaused) updateNowPlaying('Буферизация…');
+    if (player === activeAudio() && currentStation && !userPaused) {
+      updateNowPlaying('Буферизация…');
+      startBufferWatchdog();
+    }
   });
 
   player.addEventListener('stalled', () => {
     if (player === activeAudio() && currentStation && !userPaused) {
       updateNowPlaying('Восстанавливаем поток…');
-      scheduleReconnect(2200);
+      startBufferWatchdog();
     }
   });
 
   player.addEventListener('error', () => {
     if (player === activeAudio() && currentStation && !userPaused) {
+      clearPlaybackWatchdogs();
       updateNowPlaying('Ошибка потока');
-      scheduleReconnect();
+      scheduleReconnect(500);
     }
   });
 });
