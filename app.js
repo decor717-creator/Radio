@@ -1,10 +1,19 @@
 const FALLBACK_API_SERVERS = [
   'https://de1.api.radio-browser.info',
-  'https://nl1.api.radio-browser.info'
+  'https://de2.api.radio-browser.info',
+  'https://nl1.api.radio-browser.info',
+  'https://at1.api.radio-browser.info',
+  'https://fi1.api.radio-browser.info'
 ];
-let API_SERVERS = [...FALLBACK_API_SERVERS];
-const API_DISCOVERY_URL = 'https://all.api.radio-browser.info/json/servers';
-const API_TIMEOUT_MS = 4500;
+const API_DISCOVERY_URLS = [
+  'https://all.api.radio-browser.info/json/servers',
+  ...FALLBACK_API_SERVERS.map(server => `${server}/json/servers`)
+];
+const API_SERVER_CACHE_KEY = 'radioApiServers';
+const API_SERVER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const API_TIMEOUT_MS = 5000;
+const API_RACE_DELAY_MS = 300;
+let API_SERVERS = loadCachedApiServers();
 
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
@@ -67,10 +76,14 @@ let interruptedPlayback = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let connectWatchdogTimer = null;
-let bufferWatchdogTimer = null;
+let progressWatchdogTimer = null;
+let playbackAttemptId = 0;
+let lastPlaybackProgressAt = 0;
+let lastPlaybackTime = 0;
 const MAX_RECONNECT_ATTEMPTS = 4;
-const CONNECT_TIMEOUT_MS = 7000;
-const BUFFER_TIMEOUT_MS = 5000;
+const CONNECT_TIMEOUT_MS = 10000;
+const PLAYBACK_STALL_TIMEOUT_MS = 9000;
+const PLAYBACK_PROGRESS_CHECK_MS = 2000;
 const pageSize = 30;
 
 const favorites = new Set(safeParse('radioFavorites', []));
@@ -188,64 +201,103 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
   }
 }
 
-async function discoverApiServers() {
-  if (apiDiscoveryPromise) return apiDiscoveryPromise;
+function normalizeApiServers(items) {
+  return [...new Set((Array.isArray(items) ? items : [])
+    .map(item => typeof item === 'string' ? item : item?.name)
+    .map(name => String(name || '').trim().replace(/^https?:\/\//i, ''))
+    .filter(name => /^[a-z0-9.-]+\.api\.radio-browser\.info$/i.test(name))
+    .map(name => `https://${name}`))];
+}
 
-  apiDiscoveryPromise = (async () => {
-    try {
-      const response = await fetchWithTimeout(API_DISCOVERY_URL, {
-        headers: { 'Accept': 'application/json' },
-        cache: 'no-store'
-      }, 5000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+function loadCachedApiServers() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(API_SERVER_CACHE_KEY) || '{}');
+    const valid = Date.now() - Number(cached.savedAt || 0) < API_SERVER_CACHE_TTL_MS;
+    return [...new Set([...(valid ? normalizeApiServers(cached.servers) : []), ...FALLBACK_API_SERVERS])];
+  } catch (_) {
+    return [...FALLBACK_API_SERVERS];
+  }
+}
 
-      const data = await response.json();
-      const discovered = [...new Set(
-        (Array.isArray(data) ? data : [])
-          .map(item => String(item?.name || '').trim())
-          .filter(Boolean)
-          .map(name => `https://${name}`)
-      )];
+function saveApiServers(servers) {
+  try {
+    localStorage.setItem(API_SERVER_CACHE_KEY, JSON.stringify({
+      savedAt: Date.now(),
+      servers: normalizeApiServers(servers)
+    }));
+  } catch (_) {}
+}
 
-      if (discovered.length) {
-        API_SERVERS = [...new Set([...discovered, ...FALLBACK_API_SERVERS])];
-        if (!API_SERVERS.includes(activeServer)) activeServer = API_SERVERS[0];
-      }
-    } catch (err) {
-      console.warn('Radio Browser server discovery failed, using fallback mirrors', err);
-    }
+async function discoverApiServers({ force = false } = {}) {
+  if (apiDiscoveryPromise && !force) return apiDiscoveryPromise;
+
+  apiDiscoveryPromise = Promise.any(API_DISCOVERY_URLS.map(async (url, index) => {
+    if (index) await new Promise(resolve => setTimeout(resolve, index * API_RACE_DELAY_MS));
+    const response = await fetchWithTimeout(url, {
+      headers: { 'Accept': 'application/json' },
+      cache: 'no-store'
+    }, API_TIMEOUT_MS);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const discovered = normalizeApiServers(await response.json());
+    if (!discovered.length) throw new Error('Пустой список зеркал');
+    return discovered;
+  })).then(discovered => {
+    API_SERVERS = [...new Set([...discovered, ...API_SERVERS, ...FALLBACK_API_SERVERS])];
+    saveApiServers(API_SERVERS);
     return API_SERVERS;
-  })();
+  }).catch(err => {
+    console.warn('Radio Browser discovery failed, using cached mirrors', err);
+    return API_SERVERS;
+  }).finally(() => {
+    apiDiscoveryPromise = null;
+  });
 
   return apiDiscoveryPromise;
 }
 
+async function fetchApiMirror(server, path, query, signal) {
+  const response = await fetch(`${server}${path}${query}`, {
+    headers: { 'Accept': 'application/json' },
+    cache: 'no-store',
+    signal
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return { server, data: await response.json() };
+}
+
 async function apiFetch(path, params = {}) {
-  await discoverApiServers();
+  discoverApiServers().catch(() => {});
 
   const qs = new URLSearchParams(params).toString();
-  let lastError;
-  const servers = [activeServer, ...API_SERVERS.filter(s => s !== activeServer)];
+  const query = qs ? `?${qs}` : '';
+  const servers = [...new Set([activeServer, ...API_SERVERS])];
+  const controllers = servers.map(() => new AbortController());
+  const timeout = setTimeout(() => controllers.forEach(controller => controller.abort()), API_TIMEOUT_MS + servers.length * API_RACE_DELAY_MS);
 
-  for (const server of servers) {
-    try {
-      const response = await fetchWithTimeout(
-        `${server}${path}${qs ? `?${qs}` : ''}`,
-        {
-          headers: { 'Accept': 'application/json' },
-          cache: 'no-store'
-        }
-      );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      activeServer = server;
-      return await response.json();
-    } catch (err) {
-      lastError = err;
-      console.warn('Radio Browser mirror failed:', server, err?.name || err?.message || err);
-    }
+  try {
+    const result = await Promise.any(servers.map(async (server, index) => {
+      if (index) await new Promise(resolve => setTimeout(resolve, index * API_RACE_DELAY_MS));
+      try {
+        return await fetchApiMirror(server, path, query, controllers[index].signal);
+      } catch (err) {
+        console.warn('Radio Browser mirror failed:', server, err?.name || err?.message || err);
+        throw err;
+      }
+    }));
+    activeServer = result.server;
+    API_SERVERS = [result.server, ...API_SERVERS.filter(server => server !== result.server)];
+    saveApiServers(API_SERVERS);
+    controllers.forEach(controller => controller.abort());
+    return result.data;
+  } catch (err) {
+    discoverApiServers({ force: true }).catch(() => {});
+    throw err instanceof AggregateError
+      ? new Error('Все доступные зеркала каталога недоступны')
+      : err;
+  } finally {
+    clearTimeout(timeout);
+    controllers.forEach(controller => controller.abort());
   }
-
-  throw lastError || new Error('Сервис радиостанций недоступен');
 }
 
 async function loadFeatured() {
@@ -484,15 +536,15 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
     // A live stream must start as a brand-new HTTP request every time.
     // Safari may otherwise reuse a stale buffered connection after pause.
     resetStreamPlayer(player);
+    const attemptId = ++playbackAttemptId;
     player.preload = 'none';
-    player.src = freshStreamUrl(station.url);
+    player.src = station.url;
     player.load();
-    startConnectWatchdog(station, currentIndex);
+    startConnectWatchdog(station, attemptId);
     await player.play();
-    clearTimeout(connectWatchdogTimer);
-    connectWatchdogTimer = null;
-    reconnectAttempts = 0;
-    updateNowPlaying('В эфире');
+    // play() can resolve before iOS Safari actually receives audio.
+    // The "playing" event is the only place that marks the connection healthy.
+    updateNowPlaying('Запускаем эфир…');
     addToHistory(station);
     if (!recovery) reportClick(station.stationuuid);
   } catch (err) {
@@ -527,30 +579,18 @@ function resetStreamPlayer(player) {
   } catch (_) {}
 }
 
-function freshStreamUrl(url) {
-  try {
-    const parsed = new URL(url, window.location.href);
-    parsed.searchParams.set('_radioRestart', String(Date.now()));
-    return parsed.href;
-  } catch (_) {
-    const joiner = String(url).includes('?') ? '&' : '?';
-    return `${url}${joiner}_radioRestart=${Date.now()}`;
-  }
-}
-
 function clearPlaybackWatchdogs() {
   clearTimeout(connectWatchdogTimer);
-  clearTimeout(bufferWatchdogTimer);
+  clearInterval(progressWatchdogTimer);
   connectWatchdogTimer = null;
-  bufferWatchdogTimer = null;
+  progressWatchdogTimer = null;
 }
 
-function startConnectWatchdog(station, index) {
+function startConnectWatchdog(station, attemptId) {
   clearTimeout(connectWatchdogTimer);
   connectWatchdogTimer = setTimeout(() => {
-    if (!currentStation || userPaused) return;
+    if (!currentStation || userPaused || attemptId !== playbackAttemptId) return;
     if (currentStation.stationuuid !== station.stationuuid) return;
-    if (!activeAudio().paused && activeAudio().readyState >= 3) return;
 
     updateNowPlaying('Переподключаемся…');
     resetStreamPlayer(activeAudio());
@@ -558,16 +598,28 @@ function startConnectWatchdog(station, index) {
   }, CONNECT_TIMEOUT_MS);
 }
 
-function startBufferWatchdog() {
-  clearTimeout(bufferWatchdogTimer);
-  bufferWatchdogTimer = setTimeout(() => {
-    if (!currentStation || userPaused) return;
-    if (!activeAudio().paused && activeAudio().readyState >= 3) return;
+function markPlaybackProgress(player) {
+  if (player !== activeAudio() || userPaused) return;
+  const time = Number(player.currentTime || 0);
+  if (Math.abs(time - lastPlaybackTime) > 0.05) {
+    lastPlaybackTime = time;
+    lastPlaybackProgressAt = performance.now();
+  }
+}
+
+function startProgressWatchdog(player) {
+  clearInterval(progressWatchdogTimer);
+  lastPlaybackTime = Number(player.currentTime || 0);
+  lastPlaybackProgressAt = performance.now();
+  progressWatchdogTimer = setInterval(() => {
+    if (player !== activeAudio() || userPaused || player.paused) return;
+    if (performance.now() - lastPlaybackProgressAt < PLAYBACK_STALL_TIMEOUT_MS) return;
 
     updateNowPlaying('Поток завис — переподключаемся…');
-    resetStreamPlayer(activeAudio());
+    clearPlaybackWatchdogs();
+    resetStreamPlayer(player);
     scheduleReconnect(0);
-  }, BUFFER_TIMEOUT_MS);
+  }, PLAYBACK_PROGRESS_CHECK_MS);
 }
 
 function pauseRadio() {
@@ -962,10 +1014,14 @@ $('addStationForm').addEventListener('submit', (e) => {
   player.addEventListener('playing', () => {
     if (player !== activeAudio()) return;
     clearPlaybackWatchdogs();
+    startProgressWatchdog(player);
+    markPlaybackProgress(player);
     interruptedPlayback = false;
     reconnectAttempts = 0;
     updateNowPlaying('В эфире');
   });
+
+  player.addEventListener('timeupdate', () => markPlaybackProgress(player));
 
   player.addEventListener('pause', () => {
     if (player !== activeAudio() || switchingPlayer || !currentStation) return;
@@ -980,14 +1036,12 @@ $('addStationForm').addEventListener('submit', (e) => {
   player.addEventListener('waiting', () => {
     if (player === activeAudio() && currentStation && !userPaused) {
       updateNowPlaying('Буферизация…');
-      startBufferWatchdog();
     }
   });
 
   player.addEventListener('stalled', () => {
     if (player === activeAudio() && currentStation && !userPaused) {
       updateNowPlaying('Восстанавливаем поток…');
-      startBufferWatchdog();
     }
   });
 
