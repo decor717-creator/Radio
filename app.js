@@ -73,6 +73,7 @@ let activePlayer = audio;
 let userPaused = true;
 let switchingPlayer = false;
 let interruptedPlayback = false;
+let resumeAfterUserPause = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let connectWatchdogTimer = null;
@@ -499,6 +500,9 @@ function toggleFavorite(uuid) {
 
 async function playStation(station, index = -1, { recovery = false } = {}) {
   if (!station?.url) return;
+  const resumingAfterUserPause = resumeAfterUserPause;
+  resumeAfterUserPause = false;
+  const isCuratedDnb = String(station.stationuuid || '').startsWith('curated-');
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
   clearPlaybackWatchdogs();
@@ -536,6 +540,16 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
     // A live stream must start as a brand-new HTTP request every time.
     // Safari may otherwise reuse a stale buffered connection after pause.
     resetStreamPlayer(player);
+
+    // iOS/Safari sometimes needs a short gap after closing a long-lived
+    // Icecast/SHOUTcast connection. The curated DnB streams are the most
+    // sensitive to reopening the same decoder/socket immediately after pause.
+    if (resumingAfterUserPause && isCuratedDnb) {
+      updateNowPlaying('Возвращаемся в эфир…');
+      await new Promise(resolve => setTimeout(resolve, 650));
+      if (userPaused || currentStation?.stationuuid !== station.stationuuid) return;
+    }
+
     const attemptId = ++playbackAttemptId;
     player.preload = 'none';
     player.src = station.url;
@@ -624,6 +638,7 @@ function startProgressWatchdog(player) {
 
 function pauseRadio() {
   userPaused = true;
+  resumeAfterUserPause = true;
   interruptedPlayback = false;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
