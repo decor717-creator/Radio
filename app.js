@@ -33,10 +33,16 @@ const nowName = $('nowName');
 const nowDetails = $('nowDetails');
 const nowStatus = $('nowStatus');
 const nowCover = $('nowCover');
+const trackPanel = $('trackPanel');
+const nowTrackTitle = $('nowTrackTitle');
+const nowTrackArtist = $('nowTrackArtist');
+const nowTrackTime = $('nowTrackTime');
+const nowTrackProgress = $('nowTrackProgress');
 const miniPlayer = $('miniPlayer');
 const miniName = $('miniName');
 const miniStatus = $('miniStatus');
 const miniCover = $('miniCover');
+const miniTrack = $('miniTrack');
 const featuredRail = $('featuredRail');
 const featuredSection = $('featuredSection');
 const historySection = $('historySection');
@@ -58,8 +64,12 @@ let currentMode = 'popular';
 let showFavoritesOnly = false;
 let offset = 0;
 let searchTimer = null;
+let catalogRequestId = 0;
+let catalogController = null;
+let catalogLoading = false;
 let activeServer = API_SERVERS[0];
 let apiDiscoveryPromise = null;
+let apiDiscoveryAt = 0;
 let toastTimer = null;
 let sleepTimeout = null;
 let sleepInterval = null;
@@ -73,8 +83,8 @@ let activePlayer = audio;
 let userPaused = true;
 let switchingPlayer = false;
 let interruptedPlayback = false;
-let resumeAfterUserPause = false;
 let reconnectTimer = null;
+let recoveryTimer = null;
 let reconnectAttempts = 0;
 let connectWatchdogTimer = null;
 let progressWatchdogTimer = null;
@@ -86,6 +96,11 @@ const CONNECT_TIMEOUT_MS = 10000;
 const PLAYBACK_STALL_TIMEOUT_MS = 9000;
 const PLAYBACK_PROGRESS_CHECK_MS = 2000;
 const pageSize = 30;
+let trackSnapshot = {track:null,status:'idle',elapsed:null};
+let mediaMetadataKey = '';
+const trackTracker = window.RadioMetadata ? new window.RadioMetadata.Tracker({
+  onChange: snapshot => { trackSnapshot = snapshot; renderTrack(); updateMediaMetadata(); }
+}) : null;
 
 const favorites = new Set(safeParse('radioFavorites', []));
 const stationCache = safeParse('radioStationCache', {});
@@ -230,14 +245,18 @@ function saveApiServers(servers) {
 }
 
 async function discoverApiServers({ force = false } = {}) {
-  if (apiDiscoveryPromise && !force) return apiDiscoveryPromise;
+  if (apiDiscoveryPromise) return apiDiscoveryPromise;
+  if (!force && apiDiscoveryAt && Date.now() - apiDiscoveryAt < API_SERVER_CACHE_TTL_MS) return API_SERVERS;
+  const controllers = API_DISCOVERY_URLS.map(() => new AbortController());
+  const timeout = setTimeout(() => controllers.forEach(c => c.abort()), API_TIMEOUT_MS + API_DISCOVERY_URLS.length * API_RACE_DELAY_MS);
 
   apiDiscoveryPromise = Promise.any(API_DISCOVERY_URLS.map(async (url, index) => {
-    if (index) await new Promise(resolve => setTimeout(resolve, index * API_RACE_DELAY_MS));
-    const response = await fetchWithTimeout(url, {
+    const signal = controllers[index].signal;
+    if (index) await waitForMirror(index * API_RACE_DELAY_MS, signal);
+    const response = await fetch(url, {
       headers: { 'Accept': 'application/json' },
-      cache: 'no-store'
-    }, API_TIMEOUT_MS);
+      cache: 'no-store', signal
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const discovered = normalizeApiServers(await response.json());
     if (!discovered.length) throw new Error('Пустой список зеркал');
@@ -245,15 +264,27 @@ async function discoverApiServers({ force = false } = {}) {
   })).then(discovered => {
     API_SERVERS = [...new Set([...discovered, ...API_SERVERS, ...FALLBACK_API_SERVERS])];
     saveApiServers(API_SERVERS);
+    apiDiscoveryAt = Date.now();
     return API_SERVERS;
   }).catch(err => {
     console.warn('Radio Browser discovery failed, using cached mirrors', err);
     return API_SERVERS;
   }).finally(() => {
+    clearTimeout(timeout);
+    controllers.forEach(c => c.abort());
     apiDiscoveryPromise = null;
   });
 
   return apiDiscoveryPromise;
+}
+
+function waitForMirror(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(new DOMException('Request cancelled', 'AbortError')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, ms);
+    signal.addEventListener('abort', abort, {once:true});
+    if (signal.aborted) abort();
+  });
 }
 
 async function fetchApiMirror(server, path, query, signal) {
@@ -263,21 +294,26 @@ async function fetchApiMirror(server, path, query, signal) {
     signal
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return { server, data: await response.json() };
+  const data = await response.json();
+  if (!Array.isArray(data)) throw new Error('Некорректный ответ каталога');
+  return { server, data };
 }
 
-async function apiFetch(path, params = {}) {
+async function apiFetch(path, params = {}, {signal} = {}) {
+  if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
   discoverApiServers().catch(() => {});
 
   const qs = new URLSearchParams(params).toString();
   const query = qs ? `?${qs}` : '';
   const servers = [...new Set([activeServer, ...API_SERVERS])];
   const controllers = servers.map(() => new AbortController());
+  const abort = () => controllers.forEach(controller => controller.abort());
+  signal?.addEventListener('abort', abort, {once:true});
   const timeout = setTimeout(() => controllers.forEach(controller => controller.abort()), API_TIMEOUT_MS + servers.length * API_RACE_DELAY_MS);
 
   try {
     const result = await Promise.any(servers.map(async (server, index) => {
-      if (index) await new Promise(resolve => setTimeout(resolve, index * API_RACE_DELAY_MS));
+      if (index) await waitForMirror(index * API_RACE_DELAY_MS, controllers[index].signal);
       try {
         return await fetchApiMirror(server, path, query, controllers[index].signal);
       } catch (err) {
@@ -291,11 +327,13 @@ async function apiFetch(path, params = {}) {
     controllers.forEach(controller => controller.abort());
     return result.data;
   } catch (err) {
+    if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
     discoverApiServers({ force: true }).catch(() => {});
     throw err instanceof AggregateError
       ? new Error('Все доступные зеркала каталога недоступны')
       : err;
   } finally {
+    signal?.removeEventListener('abort', abort);
     clearTimeout(timeout);
     controllers.forEach(controller => controller.abort());
   }
@@ -316,9 +354,18 @@ async function loadFeatured() {
 }
 
 async function loadStations({ append = false, search = '' } = {}) {
+  if (append && catalogLoading) return;
+  cancelCatalogRequest();
   if (showFavoritesOnly) return renderFavorites();
   if (currentMode === 'custom') return renderCustomStations();
   if (currentMode === 'dnb') return renderDnbStations(search);
+
+  const requestId = catalogRequestId;
+  const controller = new AbortController();
+  catalogController = controller;
+  catalogLoading = true;
+  loadMoreBtn.disabled = true;
+  const requestedOffset = append ? offset : 0;
 
   statusText.textContent = 'Загрузка…';
   if (!append) {
@@ -332,7 +379,7 @@ async function loadStations({ append = false, search = '' } = {}) {
       ...config.params,
       hidebroken: 'true',
       limit: String(pageSize),
-      offset: String(offset),
+      offset: String(requestedOffset),
     };
     if (search) {
       params.name = search;
@@ -342,19 +389,21 @@ async function loadStations({ append = false, search = '' } = {}) {
       params.reverse = 'true';
     }
 
-    const data = await apiFetch('/json/stations/search', params);
-    const cleaned = data.map(cleanStation).filter(validStation);
+    const data = await apiFetch('/json/stations/search', params, {signal: controller.signal});
+    if (requestId !== catalogRequestId || controller.signal.aborted) return;
+    const cleaned = data.filter(s => s && typeof s === 'object').map(cleanStation).filter(validStation);
     cleaned.forEach(cacheStation);
     saveCache();
 
     stations = append ? uniqueByUuid([...stations, ...cleaned]) : cleaned;
     visibleStations = stations;
-    offset += cleaned.length;
+    offset = requestedOffset + cleaned.length;
     listTitle.textContent = search ? `Поиск: ${search}` : config.title;
     statusText.textContent = `${stations.length} станц.`;
     loadMoreBtn.hidden = cleaned.length < pageSize || Boolean(search);
     renderStations();
   } catch (err) {
+    if (requestId !== catalogRequestId || controller.signal.aborted) return;
     console.error(err);
     statusText.textContent = 'Ошибка';
     stationList.innerHTML = `
@@ -363,7 +412,22 @@ async function loadStations({ append = false, search = '' } = {}) {
         <button id="retryBtn">Повторить</button>
       </div>`;
     $('retryBtn')?.addEventListener('click', () => loadStations({ search: searchInput.value.trim() }));
+  } finally {
+    if (requestId === catalogRequestId) {
+      catalogController = null;
+      catalogLoading = false;
+      loadMoreBtn.disabled = false;
+    }
   }
+}
+
+function cancelCatalogRequest() {
+  clearTimeout(searchTimer);
+  catalogRequestId++;
+  catalogController?.abort();
+  catalogController = null;
+  catalogLoading = false;
+  loadMoreBtn.disabled = false;
 }
 
 function validStation(s) {
@@ -500,16 +564,22 @@ function toggleFavorite(uuid) {
 
 async function playStation(station, index = -1, { recovery = false } = {}) {
   if (!station?.url) return;
-  const resumingAfterUserPause = resumeAfterUserPause;
-  resumeAfterUserPause = false;
-  const isCuratedDnb = String(station.stationuuid || '').startsWith('curated-');
+  // Invalidate every earlier async start before the first possible await.
+  const attemptId = ++playbackAttemptId;
+  const isCurrent = () => attemptId === playbackAttemptId && !userPaused;
   clearTimeout(reconnectTimer);
+  clearTimeout(recoveryTimer);
   reconnectTimer = null;
+  recoveryTimer = null;
   clearPlaybackWatchdogs();
+  if (!recovery) reconnectAttempts = 0;
   userPaused = false;
   interruptedPlayback = false;
 
+  const changedStation = currentStation?.stationuuid !== station.stationuuid || currentStation?.url !== station.url;
   currentStation = station;
+  trackTracker?.stop();
+  if (changedStation) trackTracker?.setStation(station);
   cacheStation(station);
   saveCache();
   currentIndex = index >= 0 ? index : visibleStations.findIndex(s => s.stationuuid === station.stationuuid);
@@ -519,7 +589,9 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
   if (eqEnabled) {
     try {
       await ensureEqGraph();
+      if (!isCurrent()) return;
     } catch (err) {
+      if (!isCurrent()) return;
       console.warn('EQ unavailable', err);
       eqEnabled = false;
       eqToggle.checked = false;
@@ -537,32 +609,30 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
   activePlayer = player;
 
   try {
-    // A live stream must start as a brand-new HTTP request every time.
-    // Safari may otherwise reuse a stale buffered connection after pause.
+    // Close the old connection and call play in the same user action.
+    // Delaying this call can lose Safari's permission to start audible media.
     resetStreamPlayer(player);
-
-    // iOS/Safari sometimes needs a short gap after closing a long-lived
-    // Icecast/SHOUTcast connection. The curated DnB streams are the most
-    // sensitive to reopening the same decoder/socket immediately after pause.
-    if (resumingAfterUserPause && isCuratedDnb) {
-      updateNowPlaying('Возвращаемся в эфир…');
-      await new Promise(resolve => setTimeout(resolve, 650));
-      if (userPaused || currentStation?.stationuuid !== station.stationuuid) return;
-    }
-
-    const attemptId = ++playbackAttemptId;
     player.preload = 'none';
     player.src = station.url;
     player.load();
     startConnectWatchdog(station, attemptId);
     await player.play();
+    if (!isCurrent()) return;
     // play() can resolve before iOS Safari actually receives audio.
     // The "playing" event is the only place that marks the connection healthy.
-    updateNowPlaying('Запускаем эфир…');
     addToHistory(station);
     if (!recovery) reportClick(station.stationuuid);
   } catch (err) {
+    if (!isCurrent()) return;
+    clearPlaybackWatchdogs();
     console.error(err);
+
+    if (err?.name === 'NotAllowedError') {
+      pauseRadio();
+      updateNowPlaying('Нажмите ▶, чтобы продолжить эфир');
+      showToast('Для продолжения нажмите кнопку воспроизведения');
+      return;
+    }
 
     if (player === eqAudio && eqEnabled) {
       eqEnabled = false;
@@ -578,8 +648,10 @@ async function playStation(station, index = -1, { recovery = false } = {}) {
     showToast('Поток станции сейчас не воспроизводится');
     scheduleReconnect();
   } finally {
-    switchingPlayer = false;
-    renderAllPlayingStates();
+    if (attemptId === playbackAttemptId) {
+      switchingPlayer = false;
+      renderAllPlayingStates();
+    }
   }
 }
 
@@ -618,6 +690,7 @@ function markPlaybackProgress(player) {
   if (Math.abs(time - lastPlaybackTime) > 0.05) {
     lastPlaybackTime = time;
     lastPlaybackProgressAt = performance.now();
+    reconnectAttempts = 0;
   }
 }
 
@@ -627,6 +700,8 @@ function startProgressWatchdog(player) {
   lastPlaybackProgressAt = performance.now();
   progressWatchdogTimer = setInterval(() => {
     if (player !== activeAudio() || userPaused || player.paused) return;
+    // Background browsers may throttle timeupdate even while sound advances.
+    markPlaybackProgress(player);
     if (performance.now() - lastPlaybackProgressAt < PLAYBACK_STALL_TIMEOUT_MS) return;
 
     updateNowPlaying('Поток завис — переподключаемся…');
@@ -637,13 +712,16 @@ function startProgressWatchdog(player) {
 }
 
 function pauseRadio() {
+  playbackAttemptId++;
   userPaused = true;
-  resumeAfterUserPause = true;
   interruptedPlayback = false;
   clearTimeout(reconnectTimer);
+  clearTimeout(recoveryTimer);
   reconnectTimer = null;
+  recoveryTimer = null;
   clearPlaybackWatchdogs();
   reconnectAttempts = 0;
+  trackTracker?.stop();
 
   // Live radio streams should not stay half-open on iOS/Safari.
   // Fully close both media connections so Play starts a fresh stream
@@ -679,11 +757,14 @@ function recoverInterruptedPlayback() {
     return;
   }
   if (!interruptedPlayback && reconnectAttempts === 0) return;
-  setTimeout(() => {
-    if (currentStation && !userPaused && activeAudio().paused) {
+  if (recoveryTimer) return;
+  const attemptId = playbackAttemptId;
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = null;
+    if (attemptId === playbackAttemptId && currentStation && !userPaused && activeAudio().paused && document.visibilityState !== 'hidden') {
       playStation(currentStation, currentIndex, { recovery: true });
     }
-  }, 350);
+  }, 0);
 }
 function togglePlay() {
   if (!currentStation) {
@@ -710,15 +791,54 @@ function updateNowPlaying(status) {
   setCover(nowCover, currentStation);
   setCover(miniCover, currentStation);
 
+  renderTrack();
+  updateMediaMetadata();
+}
+
+function renderTrack() {
+  if (!trackPanel) return;
+  trackPanel.hidden = !currentStation;
+  const {track,status,elapsed} = trackSnapshot;
+  const setText = (element, value) => { if (element && element.textContent !== value) element.textContent = value; };
+  setText(nowTrackTitle, track?.title || (status === 'loading' ? 'Получаем название трека…' : 'Данные о треке недоступны'));
+  setText(nowTrackArtist, track ? track.artist || 'Исполнитель не передан' : 'Информация зависит от радиостанции');
+  const format = window.RadioMetadata?.clock;
+  let time = elapsed !== null && format ? (track?.duration ? `${format(elapsed)} / ${format(track.duration)}` : `${format(elapsed)} · длительность не передана`)
+    : track?.duration && format ? `— / ${format(track.duration)} · время начала не передано` : 'Время трека не передано';
+  if (status === 'paused') time = 'Пауза';
+  setText(nowTrackTime, time);
+  if (nowTrackProgress) {
+    nowTrackProgress.hidden = !track?.duration || elapsed === null || status === 'paused';
+    nowTrackProgress.value = track?.duration && elapsed !== null ? Math.min(100, elapsed / track.duration * 100) : 0;
+  }
+  setText(miniTrack, track ? [track.artist,track.title].filter(Boolean).join(' — ') : 'Название трека недоступно');
+  const miniTime = track && format && status !== 'paused' && (elapsed !== null || track.duration)
+    ? `${format(elapsed)}${track.duration ? ` / ${format(track.duration)}` : ''}` : '';
+  setText(miniStatus, [nowStatus.textContent + (eqEnabled ? ' · EQ' : ''), miniTime].filter(Boolean).join(' · '));
+}
+
+function updateMediaMetadata() {
+  if (!currentStation) return;
+  const playing = !userPaused && !activeAudio().paused;
+  const detail = [currentStation.country || currentStation.countrycode, firstTags(currentStation)].filter(Boolean).join(' · ');
+  const track = trackSnapshot.track;
+
   if ('mediaSession' in navigator) {
     try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: currentStation.name,
-        artist: detail || 'Интернет-радио',
-        album: 'Моё Радио',
+      const metadata = {
+        title: track?.title || currentStation.name,
+        artist: track?.artist || detail || 'Интернет-радио',
+        album: currentStation.name,
         artwork: currentStation.favicon ? [{ src: currentStation.favicon }] : []
-      });
-      navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+      };
+      // The song clock ticks every second; the lock-screen artwork need not.
+      const key = JSON.stringify(metadata);
+      if (key !== mediaMetadataKey) {
+        navigator.mediaSession.metadata = new MediaMetadata(metadata);
+        mediaMetadataKey = key;
+      }
+      const playbackState = playing ? 'playing' : 'paused';
+      if (navigator.mediaSession.playbackState !== playbackState) navigator.mediaSession.playbackState = playbackState;
     } catch (_) {}
   }
 }
@@ -837,6 +957,7 @@ function deleteCustomStation(uuid) {
 }
 
 function setMode(mode) {
+  cancelCatalogRequest();
   currentMode = mode;
   showFavoritesOnly = false;
   favoritesToggle.classList.remove('active');
@@ -965,18 +1086,20 @@ $('chips').addEventListener('click', (e) => {
   if (chip) setMode(chip.dataset.mode);
 });
 searchInput.addEventListener('input', () => {
-  clearTimeout(searchTimer);
+  cancelCatalogRequest();
   const q = searchInput.value.trim();
   showFavoritesOnly = false;
   favoritesToggle.classList.remove('active');
   searchTimer = setTimeout(() => q ? loadStations({ search: q }) : loadStations(), 420);
 });
 clearSearch.addEventListener('click', () => {
+  cancelCatalogRequest();
   searchInput.value = '';
   loadStations();
   searchInput.focus();
 });
 favoritesToggle.addEventListener('click', () => {
+  cancelCatalogRequest();
   showFavoritesOnly = !showFavoritesOnly;
   favoritesToggle.classList.toggle('active', showFavoritesOnly);
   document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
@@ -1027,13 +1150,13 @@ $('addStationForm').addEventListener('submit', (e) => {
 
 [audio, eqAudio].forEach(player => {
   player.addEventListener('playing', () => {
-    if (player !== activeAudio()) return;
+    if (player !== activeAudio() || userPaused || player.paused || !player.src) return;
     clearPlaybackWatchdogs();
     startProgressWatchdog(player);
     markPlaybackProgress(player);
     interruptedPlayback = false;
-    reconnectAttempts = 0;
     updateNowPlaying('В эфире');
+    trackTracker?.start();
   });
 
   player.addEventListener('timeupdate', () => markPlaybackProgress(player));
@@ -1041,6 +1164,8 @@ $('addStationForm').addEventListener('submit', (e) => {
   player.addEventListener('pause', () => {
     if (player !== activeAudio() || switchingPlayer || !currentStation) return;
     if (!userPaused) {
+      clearPlaybackWatchdogs();
+      trackTracker?.stop();
       interruptedPlayback = true;
       updateNowPlaying('Воспроизведение прервано');
     } else {
@@ -1063,13 +1188,24 @@ $('addStationForm').addEventListener('submit', (e) => {
   player.addEventListener('error', () => {
     if (player === activeAudio() && currentStation && !userPaused) {
       clearPlaybackWatchdogs();
+      trackTracker?.stop();
       updateNowPlaying('Ошибка потока');
       scheduleReconnect(500);
     }
   });
+
+  player.addEventListener('ended', () => {
+    if (player !== activeAudio() || !currentStation || userPaused || switchingPlayer) return;
+    clearPlaybackWatchdogs();
+    trackTracker?.stop();
+    interruptedPlayback = true;
+    updateNowPlaying('Эфир прерван — переподключаемся…');
+    scheduleReconnect(500);
+  });
 });
 
 document.addEventListener('visibilitychange', () => {
+  trackTracker?.visibilityChanged();
   if (document.visibilityState === 'visible') recoverInterruptedPlayback();
 });
 window.addEventListener('pageshow', recoverInterruptedPlayback);

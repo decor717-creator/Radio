@@ -11,7 +11,7 @@
   <title>Моё Радио</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="apple-touch-icon" href="icon-192.png" />
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <link rel="stylesheet" href="styles.css?v=5" />
 </head>
 <body>
   <div class="app-shell">
@@ -42,6 +42,14 @@
           <p id="nowStatus" class="now-status">Готово к эфиру</p>
           <h2 id="nowName">Выберите радиостанцию</h2>
           <p id="nowDetails">Найдите станцию или выберите популярную.</p>
+        </div>
+
+        <div id="trackPanel" class="track-panel" hidden>
+          <p class="track-label">СЕЙЧАС ИГРАЕТ</p>
+          <strong id="nowTrackTitle" class="track-title" aria-live="polite">Получаем название трека…</strong>
+          <span id="nowTrackArtist" class="track-artist">—</span>
+          <span id="nowTrackTime" class="track-time">Время трека не передано</span>
+          <progress id="nowTrackProgress" class="track-progress" max="100" value="0" aria-label="Время текущего трека" hidden></progress>
         </div>
 
         <div class="player-controls">
@@ -113,6 +121,7 @@
         <div class="mini-cover" id="miniCover">♫</div>
         <div class="mini-meta">
           <strong id="miniName">—</strong>
+          <span id="miniTrack" class="mini-track">Название трека недоступно</span>
           <span id="miniStatus">Остановлено</span>
         </div>
       </button>
@@ -206,6 +215,7 @@
 
   <audio id="audio" preload="none"></audio>
   <audio id="eqAudio" preload="none" crossorigin="anonymous"></audio>
-  <script src="app.js?v=11"></script>
+  <script src="metadata.js?v=1"></script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>
