@@ -1,6 +1,6 @@
-const CACHE = 'my-radio-shell-v11';
+const CACHE = 'my-radio-shell-v12';
 const SHELL = [
-  './', './index.html', './styles.css?v=4', './app.js?v=11',
+  './', './index.html', './styles.css?v=5', './app.js?v=12', './metadata.js?v=1',
   './manifest.webmanifest', './icon-192.png', './icon-512.png'
 ];
 
@@ -15,7 +15,7 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k.startsWith('my-radio-shell-') && k !== CACHE).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -25,6 +25,7 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  if (!SHELL.some(file => new URL(file, self.location.href).pathname === url.pathname)) return;
 
   // App files: prefer a fresh response so installed PWAs receive fixes immediately.
   // If offline, fall back to the cached shell.

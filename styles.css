@@ -150,3 +150,14 @@ h1 { margin:0; font-size:30px; letter-spacing:-.045em; }
   .fav-btn, .play-card-btn, .delete-btn { width:35px; height:35px; }
   .timer-grid { grid-template-columns:repeat(2,1fr); }
 }
+.track-panel { position:relative; display:grid; gap:6px; padding:16px; margin:18px 0 6px; border:1px solid rgba(255,255,255,.13); border-radius:16px; background:rgba(0,0,0,.16); min-width:0; }
+.track-panel[hidden], .track-progress[hidden] { display:none; }
+.track-label { margin:0; font-size:10px; font-weight:800; letter-spacing:.12em; opacity:.65; }
+.track-title { font-size:19px; line-height:1.3; overflow-wrap:anywhere; }
+.track-artist { font-size:14px; opacity:.8; overflow-wrap:anywhere; }
+.track-time { font-size:12px; opacity:.7; font-variant-numeric:tabular-nums; }
+.track-progress { width:100%; height:5px; margin-top:4px; border:0; border-radius:3px; overflow:hidden; accent-color:var(--accent); }
+.track-progress::-webkit-progress-bar { background:rgba(255,255,255,.14); }
+.track-progress::-webkit-progress-value { background:var(--accent); }
+.track-progress::-moz-progress-bar { background:var(--accent); }
+.mini-meta .mini-track { font-size:12px; opacity:.85; }
